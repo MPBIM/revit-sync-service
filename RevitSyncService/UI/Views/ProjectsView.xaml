@@ -1,0 +1,124 @@
+<UserControl x:Class="RevitSyncService.UI.Views.ProjectsView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:conv="clr-namespace:RevitSyncService.UI.Converters">
+
+    <UserControl.Resources>
+        <conv:StatusToColorConverter x:Key="StatusToColor" />
+        <conv:BoolToVisibilityConverter x:Key="BoolToVis" />
+        <conv:DateTimeToStringConverter x:Key="DateTimeToStr" />
+    </UserControl.Resources>
+
+    <DockPanel Margin="10,10,10,5">
+        <!-- Кнопки -->
+        <DockPanel DockPanel.Dock="Top" Margin="0,0,0,12">
+            <StackPanel Orientation="Horizontal">
+                <Button Content="Создать" Style="{StaticResource PrimaryButton}" 
+                    Command="{Binding CreateCommand}" Margin="0,0,8,0" />
+            <Button Content="Редактировать" Style="{StaticResource SecondaryButton}" 
+                    Command="{Binding EditCommand}" Margin="0,0,8,0" />
+            <Button Content="Удалить" Style="{StaticResource SecondaryButton}" 
+                    Command="{Binding DeleteCommand}" Margin="0,0,8,0" />
+            <Button Content="Запустить" Style="{StaticResource PrimaryButton}" 
+        Command="{Binding RunSelectedCommand}" />
+
+        </StackPanel>
+            
+        <TextBox Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}"
+             Width="200" HorizontalAlignment="Right"
+             Tag="🔍 Поиск проекта..." />
+        </DockPanel>
+        <!-- Progress -->
+        <Border DockPanel.Dock="Bottom"
+                Visibility="{Binding IsRunning, Converter={StaticResource BoolToVis}}"
+                Background="{StaticResource BgLightBrush}"
+                CornerRadius="4" Padding="12,8" Margin="0,8,0,0">
+            <StackPanel>
+                <TextBlock Text="{Binding CurrentOperation}" 
+                           Foreground="{StaticResource TextSecondaryBrush}" 
+                           FontSize="12" Margin="0,0,0,6" />
+                <ProgressBar Value="{Binding ProgressPercentage}" Margin="0,0,0,6" />
+                <DockPanel>
+                    <TextBlock Text="{Binding ProgressText}" 
+                               Foreground="{StaticResource TextSecondaryBrush}" FontSize="12" />
+                    <Button Content="Отменить" Style="{StaticResource DangerButton}"
+                            Command="{Binding CancelCommand}" 
+                            HorizontalAlignment="Right" Padding="12,4" FontSize="12" />
+                </DockPanel>
+            </StackPanel>
+        </Border>
+
+        <!-- DataGrid -->
+        <DataGrid x:Name="ProjectsGrid"
+          ItemsSource="{Binding FilteredProjects}"
+          AutoGenerateColumns="False"
+          IsReadOnly="True"
+          SelectionMode="Extended"
+          CanUserSortColumns="True"
+          HeadersVisibility="Column"
+          SelectionChanged="OnSelectionChanged">
+            <DataGrid.Columns>
+                <DataGridTextColumn Header="Название" Binding="{Binding Name}" Width="*" />
+                <DataGridTextColumn Header="Источник" Binding="{Binding SourceDisplay}" Width="*" />
+                <DataGridTextColumn Header="Расписание" Binding="{Binding ScheduleDisplay}" Width="130" />
+                <DataGridTemplateColumn Header="Статус" Width="120">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate>
+                            <TextBlock Text="{Binding StatusDisplay}" 
+                       Foreground="{Binding Status, Converter={StaticResource StatusToColor}}"
+                       FontWeight="SemiBold" />
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTextColumn Header="Посл. запуск" 
+                                    Binding="{Binding LastRun, Converter={StaticResource DateTimeToStr}}" Width="120" />
+                <DataGridTextColumn Header="След. запуск" 
+                                    Binding="{Binding NextRun, Converter={StaticResource DateTimeToStr}}" Width="120" />
+            </DataGrid.Columns>
+        </DataGrid>
+        <!-- DataGrid + Empty state -->
+        <!--<Grid>
+            <DataGrid ItemsSource="{Binding Projects}"
+              SelectedItem="{Binding SelectedProject}"
+              AutoGenerateColumns="False"
+              IsReadOnly="True"
+              SelectionMode="Single"
+              CanUserSortColumns="True"
+              HeadersVisibility="Column">
+                <DataGrid.Columns>
+                    <DataGridTextColumn Header="Название" Binding="{Binding Name}" Width="*" />
+                    <DataGridTextColumn Header="Источник" Binding="{Binding SourceDisplay}" Width="*" />
+                    <DataGridTextColumn Header="Расписание" Binding="{Binding ScheduleDisplay}" Width="130" />
+                    <DataGridTemplateColumn Header="Статус" Width="95">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding Status}" 
+                                   Foreground="{Binding Status, Converter={StaticResource StatusToColor}}"
+                                   FontWeight="SemiBold" />
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                    <DataGridTextColumn Header="Посл. запуск" 
+                                Binding="{Binding LastRun, Converter={StaticResource DateTimeToStr}}" Width="120" />
+                    <DataGridTextColumn Header="След. запуск" 
+                                Binding="{Binding NextRun, Converter={StaticResource DateTimeToStr}}" Width="120" />
+                </DataGrid.Columns>
+            </DataGrid>
+
+            --><!-- Empty state --><!--
+            <Border Visibility="{Binding IsEmpty, Converter={StaticResource BoolToVis}}"
+            Background="{StaticResource BgCardBrush}"
+            BorderBrush="{StaticResource BorderBrush}" BorderThickness="1"
+            CornerRadius="8" Padding="40">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <TextBlock Text="📁" FontSize="40" HorizontalAlignment="Center" Margin="0,0,0,12" />
+                    <TextBlock Text="Нет проектов" FontSize="16" FontWeight="SemiBold" 
+                       HorizontalAlignment="Center" Margin="0,0,0,6" />
+                    <TextBlock Text="Нажмите «Создать» чтобы добавить первый проект"
+                       Foreground="{StaticResource TextSecondaryBrush}" FontSize="13"
+                       HorizontalAlignment="Center" />
+                </StackPanel>
+            </Border>
+        </Grid>-->
+    </DockPanel>
+</UserControl>
