@@ -77,6 +77,11 @@ namespace RevitSyncService.Infrastructure.Database
                     created_at TIMESTAMP DEFAULT NOW(),
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
+
+                -- Поля для атомарной блокировки объекта (общие для ВПК и БПК)
+                ALTER TABLE projects ADD COLUMN IF NOT EXISTS locked_by TEXT;
+                ALTER TABLE projects ADD COLUMN IF NOT EXISTS locked_at TIMESTAMP;
+                ALTER TABLE projects ADD COLUMN IF NOT EXISTS last_heartbeat TIMESTAMP;
             ", conn);
 
             await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
@@ -148,6 +153,9 @@ namespace RevitSyncService.Infrastructure.Database
 
         public async Task UpsertProjectAsync(Project p)
         {
+            // Внимание: этот метод НЕ трогает locked_by/locked_at/last_heartbeat.
+            // Блокировкой управляют только TryAcquireLockAsync/ReleaseLockAsync/HeartbeatLockAsync,
+            // чтобы обычное сохранение настроек проекта не могло случайно снять чужой активный лок.
             await using var conn = new NpgsqlConnection(_connectionString);
             await conn.OpenAsync().ConfigureAwait(false);
             await using var cmd = new NpgsqlCommand(@"
@@ -252,9 +260,129 @@ namespace RevitSyncService.Infrastructure.Database
                 LastRun = r["last_run"] as DateTime?,
                 NextRun = r["next_run"] as DateTime?,
                 Status = Enum.TryParse<ProjectStatus>(r["status"].ToString(), out var s) ? s : ProjectStatus.Waiting,
+                LockedBy = r["locked_by"] as string,
+                LockedAt = r["locked_at"] as DateTime?,
+                LastHeartbeat = r["last_heartbeat"] as DateTime?,
                 CreatedAt = (DateTime)r["created_at"],
                 UpdatedAt = (DateTime)r["updated_at"]
             };
+        }
+
+        // === ЗАХВАТ ОБЪЕКТА (БЛОКИРОВКИ) ===
+        // Единый механизм для ВПК (авто-очередь) и БПК (ручной запуск).
+
+        /// <summary>
+        /// Атомарная попытка захватить объект. Захват удаётся, если объект свободен,
+        /// либо если предыдущий захват "протух" (last_heartbeat старше staleAfter).
+        /// </summary>
+        public async Task<ProjectLockInfo> TryAcquireLockAsync(string projectId, string lockedBy, TimeSpan staleAfter)
+        {
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync().ConfigureAwait(false);
+
+            await using (var cmd = new NpgsqlCommand(@"
+                UPDATE projects
+                SET locked_by = @locked_by,
+                    locked_at = NOW(),
+                    last_heartbeat = NOW()
+                WHERE id = @id
+                  AND (
+                        locked_by IS NULL
+                        OR last_heartbeat IS NULL
+                        OR last_heartbeat < NOW() - (@stale_seconds || ' seconds')::interval
+                      )
+                RETURNING locked_by, locked_at;", conn))
+            {
+                cmd.Parameters.AddWithValue("id", projectId);
+                cmd.Parameters.AddWithValue("locked_by", lockedBy);
+                cmd.Parameters.AddWithValue("stale_seconds", (int)staleAfter.TotalSeconds);
+
+                await using var reader = await cmd.ExecuteReaderAsync().ConfigureAwait(false);
+                if (await reader.ReadAsync().ConfigureAwait(false))
+                {
+                    return new ProjectLockInfo
+                    {
+                        ProjectId = projectId,
+                        Acquired = true,
+                        LockedBy = reader["locked_by"] as string,
+                        LockedAt = reader["locked_at"] as DateTime?
+                    };
+                }
+            }
+
+            // Не получилось — сообщаем, кто держит объект сейчас, чтобы показать пользователю
+            return await GetLockInfoAsync(projectId, conn).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// "Продлить" удержание блокировки во время долгой обработки.
+        /// Возвращает false, если блокировку уже перехватили как протухшую —
+        /// в этом случае вызывающий код должен НЕМЕДЛЕННО прекратить работу с объектом.
+        /// </summary>
+        public async Task<bool> HeartbeatLockAsync(string projectId, string lockedBy)
+        {
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync().ConfigureAwait(false);
+            await using var cmd = new NpgsqlCommand(@"
+                UPDATE projects
+                SET last_heartbeat = NOW()
+                WHERE id = @id AND locked_by = @locked_by", conn);
+
+            cmd.Parameters.AddWithValue("id", projectId);
+            cmd.Parameters.AddWithValue("locked_by", lockedBy);
+
+            int affected = await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+            return affected > 0;
+        }
+
+        /// <summary>
+        /// Снять блокировку. Снимает только СВОЮ блокировку (по locked_by) —
+        /// если её уже перехватили как протухшую, чужую блокировку не тронет.
+        /// </summary>
+        public async Task ReleaseLockAsync(string projectId, string lockedBy)
+        {
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync().ConfigureAwait(false);
+            await using var cmd = new NpgsqlCommand(@"
+                UPDATE projects
+                SET locked_by = NULL,
+                    locked_at = NULL,
+                    last_heartbeat = NULL
+                WHERE id = @id AND locked_by = @locked_by", conn);
+
+            cmd.Parameters.AddWithValue("id", projectId);
+            cmd.Parameters.AddWithValue("locked_by", lockedBy);
+            await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Просто прочитать текущее состояние блокировки, без попытки захвата.
+        /// </summary>
+        public async Task<ProjectLockInfo> GetLockInfoAsync(string projectId)
+        {
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync().ConfigureAwait(false);
+            return await GetLockInfoAsync(projectId, conn).ConfigureAwait(false);
+        }
+
+        private static async Task<ProjectLockInfo> GetLockInfoAsync(string projectId, NpgsqlConnection conn)
+        {
+            await using var cmd = new NpgsqlCommand(
+                "SELECT locked_by, locked_at FROM projects WHERE id = @id", conn);
+            cmd.Parameters.AddWithValue("id", projectId);
+
+            await using var reader = await cmd.ExecuteReaderAsync().ConfigureAwait(false);
+            if (await reader.ReadAsync().ConfigureAwait(false))
+            {
+                return new ProjectLockInfo
+                {
+                    ProjectId = projectId,
+                    Acquired = false,
+                    LockedBy = reader["locked_by"] as string,
+                    LockedAt = reader["locked_at"] as DateTime?
+                };
+            }
+            return new ProjectLockInfo { ProjectId = projectId, Acquired = false };
         }
 
         // === CLASH TASKS ===
@@ -357,5 +485,17 @@ namespace RevitSyncService.Infrastructure.Database
 
         public void SaveGlobalSettings(GlobalSettings settings)
             => Task.Run(() => SaveGlobalSettingsAsync(settings)).GetAwaiter().GetResult();
+
+        public ProjectLockInfo TryAcquireLock(string projectId, string lockedBy, TimeSpan staleAfter)
+            => Task.Run(() => TryAcquireLockAsync(projectId, lockedBy, staleAfter)).GetAwaiter().GetResult();
+
+        public bool HeartbeatLock(string projectId, string lockedBy)
+            => Task.Run(() => HeartbeatLockAsync(projectId, lockedBy)).GetAwaiter().GetResult();
+
+        public void ReleaseLock(string projectId, string lockedBy)
+            => Task.Run(() => ReleaseLockAsync(projectId, lockedBy)).GetAwaiter().GetResult();
+
+        public ProjectLockInfo GetLockInfo(string projectId)
+            => Task.Run(() => GetLockInfoAsync(projectId)).GetAwaiter().GetResult();
     }
 }

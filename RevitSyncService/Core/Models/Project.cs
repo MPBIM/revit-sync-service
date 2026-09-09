@@ -20,6 +20,25 @@ namespace RevitSyncService.Core.Models
         public DateTime UpdatedAt { get; set; } = DateTime.Now;
 
         /// <summary>
+        /// Кто сейчас держит объект (ВПК или БПК). null — свободен.
+        /// Заполняется/очищается ТОЛЬКО через DbRepository.TryAcquireLock/ReleaseLock —
+        /// обычный UpsertProject эти поля не трогает.
+        /// </summary>
+        public string? LockedBy { get; set; }
+        public DateTime? LockedAt { get; set; }
+        public DateTime? LastHeartbeat { get; set; }
+
+        [System.Text.Json.Serialization.JsonIgnore]
+        public bool IsLocked => !string.IsNullOrEmpty(LockedBy);
+
+        /// <summary>
+        /// Строка для UI: "Занято: ВПК-2 / svc_bim, с 13:00"
+        /// </summary>
+        [System.Text.Json.Serialization.JsonIgnore]
+        public string LockDisplay
+            => IsLocked ? $"Занято: {LockedBy}, с {LockedAt:HH:mm}" : string.Empty;
+
+        /// <summary>
         /// Краткое описание источника для отображения в DataGrid
         /// </summary>
         public string SourceDisplay

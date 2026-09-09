@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using RevitSyncService.Core.Interfaces;
 using RevitSyncService.Core.Models;
+using RevitSyncService.Infrastructure.Database;
 
 namespace RevitSyncService.Core.Services
 {
@@ -19,6 +20,13 @@ namespace RevitSyncService.Core.Services
         private readonly List<Project> _queue = new();
         private CancellationTokenSource? _cts;
         private bool _isProcessing;
+
+        // Сколько времени объект считается реально занятым без подтверждения (heartbeat),
+        // прежде чем блокировку можно перехватить как "протухшую" (машина упала/зависла).
+        private static readonly TimeSpan LockStaleAfter = TimeSpan.FromMinutes(20);
+
+        // Как часто продлевать блокировку во время долгой обработки одного объекта.
+        private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromMinutes(3);
 
         public event Action<ProgressInfo>? OnProgress;
         public event Action? OnCompleted;
@@ -54,6 +62,9 @@ namespace RevitSyncService.Core.Services
 
         /// <summary>
         /// Добавить проекты в очередь. Если обработка не идёт — запустить.
+        /// Используется одинаково и планировщиком (авто-очередь на ВПК),
+        /// и кнопкой ручного запуска (БПК) — реальная защита от параллельной
+        /// обработки одного и того же объекта находится ниже, в ProcessSingleProjectAsync.
         /// </summary>
         public void EnqueueProjects(List<Project> projects)
         {
@@ -157,22 +168,48 @@ namespace RevitSyncService.Core.Services
         }
 
         /// <summary>
-        /// Обработка одного проекта
+        /// Обработка одного проекта. Единая точка защиты от параллельной выгрузки:
+        /// сначала пытаемся атомарно захватить объект в БД. Если не вышло — значит
+        /// его прямо сейчас обрабатывает другая машина (ВПК или БПК), и мы просто
+        /// пропускаем его, не трогая файлы и не сдвигая расписание.
         /// </summary>
         private async Task ProcessSingleProjectAsync(Project project, IProgress<ProgressInfo>? progress, CancellationToken ct)
         {
+            var repo = _configService.Repository;
+            string me = MachineIdentity.Current;
+
+            if (repo != null)
+            {
+                var lockInfo = repo.TryAcquireLock(project.Id, me, LockStaleAfter);
+                if (!lockInfo.Acquired)
+                {
+                    project.Status = ProjectStatus.Waiting;
+                    _log.Warning(
+                        $"Пропущено: объект уже выгружается ({lockInfo.LockedBy}, с {lockInfo.LockedAt:HH:mm})",
+                        project.Name);
+                    return;
+                }
+            }
+
             project.Status = ProjectStatus.Running;
             _log.Info($"Запуск проекта: {project.Name}", project.Name);
 
+            // Объединённый токен: остановит работу и по кнопке "Отмена",
+            // и если блокировку у нас перехватят как протухшую (см. RunHeartbeatLoopAsync).
+            using var workCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            Task heartbeatTask = repo == null
+                ? Task.CompletedTask
+                : RunHeartbeatLoopAsync(repo, project, me, workCts);
+
             try
             {
-                var downloadedFiles = await _downloadService.DownloadFilesAsync(project, progress, ct);
+                var downloadedFiles = await _downloadService.DownloadFilesAsync(project, progress, workCts.Token);
 
                 if (project.Destination.CreateNwc && downloadedFiles.Count > 0)
                 {
                     string revitVersion = project.Source.RevitVersion ?? "2025";
                     int converted = await _conversionService.ConvertToNwcAsync(
-                        downloadedFiles, project.Destination.NwcPath, revitVersion, progress, ct);
+                        downloadedFiles, project.Destination.NwcPath, revitVersion, progress, workCts.Token);
                     _log.Info($"Конвертировано: {converted}/{downloadedFiles.Count}", project.Name);
                 }
 
@@ -211,6 +248,42 @@ namespace RevitSyncService.Core.Services
             {
                 _projectManager.MarkCompleted(project.Id, ProjectStatus.Failed);
                 _log.Error($"Ошибка: {project.Name}", project.Name, ex.ToString());
+            }
+            finally
+            {
+                workCts.Cancel();
+                try { await heartbeatTask.ConfigureAwait(false); } catch { /* фоновая, не критично */ }
+
+                if (repo != null)
+                    repo.ReleaseLock(project.Id, me);
+            }
+        }
+
+        /// <summary>
+        /// Периодически продлевает блокировку, пока идёт скачивание/конвертация.
+        /// Если продление не удалось (кто-то перехватил лок как протухший) —
+        /// отменяет workCts, чтобы немедленно остановить скачивание/запись файла.
+        /// </summary>
+        private static async Task RunHeartbeatLoopAsync(
+            DbRepository repo, Project project, string lockedBy, CancellationTokenSource workCts)
+        {
+            try
+            {
+                while (!workCts.IsCancellationRequested)
+                {
+                    await Task.Delay(HeartbeatInterval, workCts.Token).ConfigureAwait(false);
+
+                    bool stillOurs = repo.HeartbeatLock(project.Id, lockedBy);
+                    if (!stillOurs)
+                    {
+                        workCts.Cancel();
+                        break;
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // нормальное завершение при отмене/окончании работы
             }
         }
 
